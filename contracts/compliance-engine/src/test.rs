@@ -2,6 +2,7 @@
 
 use crate::{
     ComplianceEngine, ComplianceEngineClient, ComplianceError, ComplianceRules, PolicyChangeKind,
+    TierPolicy,
 };
 use kyc_registry::{KycRegistry, KycRegistryClient};
 use soroban_sdk::{
@@ -786,7 +787,6 @@ fn test_max_holding_period_zero_means_unlimited() {
 
 #[test]
 fn test_tier_policy_blocked_pair() {
-    use crate::TierPolicy;
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -808,7 +808,6 @@ fn test_tier_policy_blocked_pair() {
 
 #[test]
 fn test_tier_policy_exact_match_overrides_wildcard() {
-    use crate::TierPolicy;
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -1281,4 +1280,152 @@ fn test_blocklist_and_allowlist_independent() {
     ce.remove_from_blocklist(&addr);
     assert!(!ce.is_blocklisted(&addr));
     assert!(ce.is_allowlisted(&addr));
+}
+
+// ── Regression tests for targeted validation fixes ────────────────────────────
+
+// Fix 1 — add_to_allowlist: reject blocklisted address
+// Before the fix, an address already on the blocklist could also be added to
+// the allowlist.  The blocklist check in evaluate_transfer_inner always runs
+// first, so the allowlist entry would never have any effect — but it would
+// still consume persistent storage and write a misleading AllowlistAdd policy
+// record.  The fix panics with BlocklistedAddressOnAllowlist before touching
+// storage, keeping both lists mutually exclusive.
+#[test]
+fn test_add_to_allowlist_rejects_blocklisted_address() {
+    let (env, ce, _) = setup();
+    let addr = Address::generate(&env);
+
+    // Put the address on the blocklist first.
+    ce.add_to_blocklist(&addr);
+    assert!(ce.is_blocklisted(&addr));
+
+    // Attempting to allowlist the same address must be rejected.
+    assert_eq!(
+        ce.try_add_to_allowlist(&addr),
+        Err(Ok(Error::from(
+            ComplianceError::BlocklistedAddressOnAllowlist
+        )))
+    );
+
+    // Storage must be untouched: no allowlist entry written, count stays 0.
+    assert!(!ce.is_allowlisted(&addr));
+    assert_eq!(ce.allowlist_count(), 0);
+
+    // Normal path still works: a non-blocklisted address can be allowlisted.
+    let other = Address::generate(&env);
+    ce.add_to_allowlist(&other);
+    assert!(ce.is_allowlisted(&other));
+    assert_eq!(ce.allowlist_count(), 1);
+}
+
+// Fix 2 — set_tier_policy: reject negative max_transfer_amount
+// Before the fix, a TierPolicy with a negative max_transfer_amount could be
+// stored.  The enforcement check in evaluate_transfer_inner uses `> 0` as the
+// "cap is enabled" sentinel, so a negative value would be stored silently but
+// never trip the denial branch — effectively disabling the cap while looking
+// like it was set.  The fix panics with NegativeTierTransferAmount before any
+// state is written.
+#[test]
+fn test_set_tier_policy_rejects_negative_max_transfer_amount() {
+    let (_, ce, _) = setup();
+
+    // Negative cap must be rejected before storage is touched.
+    assert_eq!(
+        ce.try_set_tier_policy(
+            &0u32,
+            &1u32,
+            &TierPolicy {
+                blocked: false,
+                max_transfer_amount: -1,
+                min_from_tier: 0,
+                min_to_tier: 0,
+            }
+        ),
+        Err(Ok(Error::from(ComplianceError::NegativeTierTransferAmount)))
+    );
+
+    // No policy must have been written.
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_none());
+    assert_eq!(ce.tier_policy_count(), 0);
+
+    // Normal path: zero and positive amounts are both accepted.
+    ce.set_tier_policy(
+        &0u32,
+        &1u32,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 0,
+            min_from_tier: 0,
+            min_to_tier: 0,
+        },
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_some());
+
+    ce.set_tier_policy(
+        &0u32,
+        &2u32,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 1_000,
+            min_from_tier: 0,
+            min_to_tier: 0,
+        },
+    );
+    assert!(ce.get_tier_policy(&0u32, &2u32).is_some());
+}
+
+// Fix 3 — validate_rules: max_holders boundary
+// The guard rejects max_holders strictly less than the live holder count.
+// The exact-equal boundary (max_holders == holder_count) must be accepted:
+// it prevents new holders from joining but does not break existing ones.
+// This test makes both the rejected and the accepted boundary explicit.
+#[test]
+fn test_validate_rules_max_holders_boundary() {
+    let (env, ce, _) = setup();
+
+    // Register exactly 2 holders.
+    ce.register_holder(&Address::generate(&env));
+    ce.register_holder(&Address::generate(&env));
+    assert_eq!(ce.holder_count(), 2);
+
+    // max_holders < holder_count (1 < 2) → must be rejected.
+    assert_eq!(
+        ce.try_set_rules(&rules(0, 0, 1, false)),
+        Err(Ok(Error::from(
+            ComplianceError::MaxHoldersBelowCurrentCount
+        )))
+    );
+
+    // max_holders == holder_count (2 == 2) → must be accepted (freeze at current).
+    ce.set_rules(&rules(0, 0, 2, false));
+    assert_eq!(ce.get_rules().max_holders, 2);
+
+    // max_holders > holder_count (3 > 2) → must be accepted.
+    ce.set_rules(&rules(0, 0, 3, false));
+    assert_eq!(ce.get_rules().max_holders, 3);
+}
+
+// Fix 4 — propose_rules: reject empty description
+// Before the fix, propose_rules accepted an empty description string and
+// stored it into PendingRulesProposal and eventually into a PolicyRecord,
+// leaving the governance audit trail with meaningless blank entries.
+// The fix panics with EmptyDescription before any state is written.
+#[test]
+fn test_propose_rules_rejects_empty_description() {
+    let (env, ce, _) = setup();
+    let empty = String::from_str(&env, "");
+
+    // Empty string must be rejected — no proposal stored.
+    assert_eq!(
+        ce.try_propose_rules(&rules(0, 0, 0, false), &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyDescription)))
+    );
+    assert!(ce.get_pending_proposal().is_none());
+
+    // Normal path: non-empty description must still be accepted.
+    let desc = String::from_str(&env, "raise transfer cap for Q4");
+    ce.propose_rules(&rules(0, 0, 0, false), &desc);
+    let proposal = ce.get_pending_proposal().expect("proposal must be stored");
+    assert_eq!(proposal.description, desc);
 }

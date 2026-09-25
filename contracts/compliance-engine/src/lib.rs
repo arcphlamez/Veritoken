@@ -68,6 +68,18 @@ pub enum ComplianceError {
     InvalidRiskConfig = 8,
     AlreadyAtSchemaVersion = 9,
     MigrationVersionNotSequential = 10,
+    /// Returned when an address that is already on the blocklist is submitted
+    /// for allowlist addition.  Storing a blocklisted address on the allowlist
+    /// creates a contradictory enforcement state and is rejected eagerly.
+    BlocklistedAddressOnAllowlist = 11,
+    /// Returned when `set_tier_policy` receives a `TierPolicy` whose
+    /// `max_transfer_amount` is negative.  A negative cap is nonsensical and
+    /// would silently bypass the amount check inside `evaluate_transfer_inner`.
+    NegativeTierTransferAmount = 12,
+    /// Returned when `propose_rules` is called with an empty description
+    /// string.  Every governance proposal must carry a human-readable reason
+    /// so the policy audit trail remains meaningful.
+    EmptyDescription = 13,
 }
 
 // ── Tier policy types ─────────────────────────────────────────────────────────
@@ -317,6 +329,13 @@ impl ComplianceEngine {
     /// `rule_change_delay` seconds have elapsed.
     pub fn propose_rules(env: Env, new_rules: ComplianceRules, description: String) {
         Self::require_admin(&env);
+        // Every governance proposal must carry a non-empty description so that
+        // the on-chain policy audit trail remains meaningful.  An empty string
+        // would produce a `PolicyRecord` with no human-readable context, making
+        // it impossible to understand why a rule change was made after the fact.
+        if description.len() == 0 {
+            panic_with_error!(env, ComplianceError::EmptyDescription);
+        }
         Self::validate_rules(&env, &new_rules);
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let delay: u64 = env
@@ -581,6 +600,19 @@ impl ComplianceEngine {
     pub fn add_to_allowlist(env: Env, addr: Address) {
         Self::require_admin(&env);
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        // Reject the addition when the address is already on the blocklist.
+        // Storing a blocklisted address on the allowlist would create a
+        // contradictory enforcement state: the blocklist check in
+        // `evaluate_transfer_inner` always wins, so the allowlist entry would
+        // never have effect but would silently consume storage and mislead
+        // auditors reading the policy history.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::BlocklistEntry(addr.clone()))
+        {
+            panic_with_error!(env, ComplianceError::BlocklistedAddressOnAllowlist);
+        }
         let entry_key = DataKey::AllowlistEntry(addr.clone());
         if !env.storage().persistent().has(&entry_key) {
             env.storage().persistent().set(&entry_key, &true);
@@ -1221,6 +1253,13 @@ impl ComplianceEngine {
 
     pub fn set_tier_policy(env: Env, from_tier: u32, to_tier: u32, policy: TierPolicy) {
         Self::require_admin(&env);
+        // A negative max_transfer_amount is nonsensical: the amount check in
+        // `evaluate_transfer_inner` uses `> 0` as the "enabled" sentinel, so a
+        // negative value would be stored silently but never trigger a denial,
+        // effectively disabling the cap in a misleading way.
+        if policy.max_transfer_amount < 0 {
+            panic_with_error!(env, ComplianceError::NegativeTierTransferAmount);
+        }
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let key = DataKey::TierPolicy(TierPolicyKey { from_tier, to_tier });
         let is_new = !env.storage().instance().has(&key);
@@ -1453,6 +1492,11 @@ impl ComplianceEngine {
                 .instance()
                 .get(&DataKey::HolderCount)
                 .unwrap_or(0);
+            // Reject any cap that would be immediately violated by the live
+            // holder count.  The boundary condition `max_holders == count` is
+            // intentionally allowed: it prevents *new* holders from joining
+            // while leaving existing holders unaffected.  Only strictly less
+            // than is an impossible state.
             if rules.max_holders < count {
                 panic_with_error!(env, ComplianceError::MaxHoldersBelowCurrentCount);
             }
